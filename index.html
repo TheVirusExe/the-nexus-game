@@ -66,6 +66,7 @@
             align-items: center;
             flex-direction: column;
             z-index: 100;
+            color: #fff;
         }
         #win-screen {
             position: absolute;
@@ -82,6 +83,8 @@
             z-index: 100;
             font-size: 2.2rem;
             letter-spacing: 4px;
+            opacity: 0;
+            transition: opacity 1s ease;
         }
         #panic-overlay {
             position: absolute;
@@ -324,8 +327,8 @@
             position: absolute;
             top: 25px;
             right: 25px;
-            width: 130px;
-            height: 130px;
+            width: 140px;
+            height: 140px;
             background: rgba(10, 10, 10, 0.9);
             border: 1px solid #333;
             z-index: 6;
@@ -336,8 +339,8 @@
             position: absolute;
             top: 25px;
             right: 25px;
-            width: 130px;
-            height: 130px;
+            width: 140px;
+            height: 140px;
             background: #000;
             border: 1px solid #555;
             z-index: 7;
@@ -365,11 +368,14 @@
     </div>
 
     <div id="death-screen">
+        <div id="death-time" style="color:#aaa; font-size:1.1rem; margin-bottom:20px; letter-spacing:1px;"></div>
         <button class="btn" id="death-retry-btn" style="opacity: 0; transition: opacity 1s ease;">RETRY</button>
     </div>
+    
     <div id="win-screen">
-        <div>YOU ESCAPED THE NEXUS</div>
-        <button class="btn" id="retry-btn" style="margin-top:20px;">RETRY</button>
+        <div style="font-size: 2.5rem; letter-spacing: 4px; margin-bottom: 10px;">YOU WIN</div>
+        <div id="win-time" style="color:#aaa; font-size:1.1rem; margin-bottom:25px; letter-spacing:1px;"></div>
+        <button class="btn" id="retry-btn">RETRY</button>
     </div>
 
     <div id="cooldowns-panel">
@@ -432,7 +438,7 @@
     <div id="soundbar-container"><div id="soundbar-fill"></div></div>
 
     <div id="discontinued-watermark">DISCONTINUED</div>
-    <canvas id="minimap" width="130" height="130"></canvas>
+    <canvas id="minimap" width="140" height="140"></canvas>
     <div id="minimap-error">ERROR</div>
 
     <div id="instructions">WASD/Arrows to move. Shift to run. Hold Left-Click on floating gears to collect. Press P to ping nearest gear distance. Press C to crouch. Press M for Dev Menu. ESC to pause.</div>
@@ -452,7 +458,10 @@
         let gamePaused = true;
         let firstGearEventTriggered = false;
         let ceilingLightsOffPermanently = false;
-        let thirdGearMinimapBlackout = false;
+        let minimapErrorPermanentlyActive = false;
+        let isEndingChase = false;
+        let gameStartTime = 0;
+        let survivalTime = 0;
 
         const cursorEl = document.getElementById('custom-cursor');
         document.addEventListener('mousemove', (e) => {
@@ -534,8 +543,10 @@
         function triggerDeath() {
             if (isDead || cheatGodmode) return;
             isDead = true;
+            survivalTime = (performance.now() - gameStartTime) / 1000;
             let deathScreen = document.getElementById('death-screen');
             deathScreen.style.display = 'flex';
+            document.getElementById('death-time').innerText = `You survived for ${Math.floor(survivalTime)} seconds`;
             const ambEl = document.getElementById('ambn-audio');
             const chsEl = document.getElementById('chs-audio');
             if (ambEl) ambEl.pause();
@@ -601,7 +612,7 @@
 
         function createMainMonster() {
             const group = new THREE.Group();
-            const skinMat = new THREE.MeshStandardMaterial({ color: 0x020202, roughness: 0.8 });
+            const skinMat = new THREE.MeshBasicMaterial({ color: 0x020202 });
 
             const pelvis = new THREE.Group();
             pelvis.name = 'pelvis';
@@ -803,6 +814,34 @@
             } catch (e) {}
         }
 
+        function playScreechAudio() {
+            const screechEl = document.getElementById('screech-audio');
+            if (screechEl) {
+                screechEl.currentTime = 0;
+                screechEl.play().catch(e => {});
+            }
+        }
+
+        function playLongDeepChaseBoom() {
+            if (!audioCtx) return;
+            try {
+                const now = audioCtx.currentTime;
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(55, now);
+                osc.frequency.exponentialRampToValueAtTime(8, now + 4.5);
+
+                gain.gain.setValueAtTime(1.2, now);
+                gain.gain.exponentialRampToValueAtTime(0.001, now + 5.0);
+
+                osc.connect(gain);
+                gain.connect(audioCtx.destination);
+                osc.start(now);
+                osc.stop(now + 5.0);
+            } catch(e) {}
+        }
+
         function playMonsterHeavyFootstep(distance) {
             if (!audioCtx) return;
             if (distance > 22) return;
@@ -817,7 +856,7 @@
 
                 const noise = audioCtx.createBufferSource();
                 noise.buffer = buffer;
-                noise.playbackRate.value = 0.45;
+                noise.playbackRate.value = (isEndingChase) ? 0.35 : 0.45;
 
                 const filter = audioCtx.createBiquadFilter();
                 filter.type = 'lowpass';
@@ -835,7 +874,7 @@
                 distortion.curve = makeDistortionCurve(300);
 
                 const gain = audioCtx.createGain();
-                let vol = Math.max(0.6, 5.5 * (1 - distance / 22));
+                let vol = isEndingChase ? 6.5 : Math.max(0.6, 5.5 * (1 - distance / 22));
                 gain.gain.setValueAtTime(vol, now);
                 gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
 
@@ -951,7 +990,20 @@
                 }
             }
 
-            if (monsterSpawned && mainMonster && gearsCollected < 5) {
+            if (!minimapErrorPermanentlyActive) {
+                for (let g of gears) {
+                    if (!g.collected) {
+                        let gx = (g.mesh.position.x / (mazeWidth * tileSize)) * 140;
+                        let gz = (g.mesh.position.z / (mazeHeight * tileSize)) * 140;
+                        ctx.fillStyle = '#ffcc00';
+                        ctx.beginPath();
+                        ctx.arc(gx, gz, 2.5, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+                }
+            }
+
+            if (monsterSpawned && mainMonster && gearsCollected < 5 && !minimapErrorPermanentlyActive) {
                 let mx = (mainMonster.position.x / (mazeWidth * tileSize)) * 140;
                 let mz = (mainMonster.position.z / (mazeHeight * tileSize)) * 140;
                 ctx.fillStyle = '#ff0000';
@@ -1119,6 +1171,7 @@
             function fullResetGame() {
                 isDead = false;
                 hasWon = false;
+                isEndingChase = false;
                 monsterSpawned = false;
                 gearsCollected = 0;
                 isCrouching = false;
@@ -1130,7 +1183,8 @@
                 crouchCooldown = 0;
                 firstGearEventTriggered = false;
                 ceilingLightsOffPermanently = false;
-                thirdGearMinimapBlackout = false;
+                minimapErrorPermanentlyActive = false;
+                gameStartTime = performance.now();
                 document.getElementById('hud-gear').innerText = `Gears Collected: 0 / 5`;
                 document.getElementById('death-screen').style.display = 'none';
                 document.getElementById('win-screen').style.display = 'none';
@@ -1171,6 +1225,7 @@
                     ambEl.volume = 0.25;
                     ambEl.play().catch(e => {});
                 }
+                gameStartTime = performance.now();
                 gamePaused = false;
                 ui.style.opacity = '0';
                 setTimeout(() => ui.style.display = 'none', 500);
@@ -1294,7 +1349,7 @@
             }
 
             if (e.code === 'KeyP' && isDown && pingCooldown <= 0) {
-                pingCooldown = maxPingCooldown;
+                pingCooldown = 10.0;
                 let closestDist = Infinity;
                 let closestGear = null;
                 for (let g of gears) {
@@ -1388,7 +1443,7 @@
         }
 
         function updateMainMonster(delta) {
-            if (!monsterSpawned || !mainMonster || isDead || gamePaused || hasWon) return;
+            if (!monsterSpawned || !mainMonster || isDead || hasWon) return;
 
             let mGridX = Math.floor((mainMonster.position.x + tileSize / 2) / tileSize);
             let mGridZ = Math.floor((mainMonster.position.z + tileSize / 2) / tileSize);
@@ -1402,7 +1457,7 @@
                 monsterAmbientGain.gain.setTargetAtTime(ambVol, audioCtx.currentTime, 0.1);
             }
 
-            if (!cheatFreezeMonster) {
+            if (!cheatFreezeMonster && !isEndingChase) {
                 if (mainMonster.position.distanceTo(lastMonsterPos) < 0.05 * delta) {
                     monsterStuckTimer += delta;
                     if (monsterStuckTimer > 10.0) {
@@ -1426,18 +1481,45 @@
             }
 
             if (!isCrouching && distToPlayer < 1.6 && !cheatFreezeMonster && !cheatGodmode) {
-                triggerDeath();
-                return;
+                if (isEndingChase) {
+                    // Fake death screen on win chase touch
+                    isDead = true;
+                    survivalTime = (performance.now() - gameStartTime) / 1000;
+                    let deathScreen = document.getElementById('death-screen');
+                    deathScreen.style.display = 'flex';
+                    document.getElementById('death-time').innerText = '';
+                    document.getElementById('death-retry-btn').style.opacity = '0';
+                    const ambEl = document.getElementById('ambn-audio');
+                    const chsEl = document.getElementById('chs-audio');
+                    if (ambEl) ambEl.pause();
+                    if (chsEl) chsEl.pause();
+                    if (document.pointerLockElement) document.exitPointerLock();
+
+                    setTimeout(() => {
+                        deathScreen.style.display = 'none';
+                        let winScreen = document.getElementById('win-screen');
+                        winScreen.style.display = 'flex';
+                        setTimeout(() => { winScreen.style.opacity = '1'; }, 50);
+                        document.getElementById('win-time').innerText = `You survived for ${Math.floor(survivalTime)} seconds`;
+                    }, 2000);
+                    return;
+                } else {
+                    triggerDeath();
+                    return;
+                }
             }
 
             let playerRunning = (isSprinting && (moveForward || moveBackward || moveLeft || moveRight) && (stamina > 0 || cheatInfStamina));
             let soundHeard = (playerRunning && distToPlayer < 11.0 && hasLineOfSight(mainMonster.position, playerPos));
-            let canSeePlayer = !isCrouching && ((distToPlayer < 15.0 && hasLineOfSight(mainMonster.position, playerPos)) || soundHeard);
+            let canSeePlayer = isEndingChase || (!isCrouching && ((distToPlayer < 15.0 && hasLineOfSight(mainMonster.position, playerPos)) || soundHeard));
 
             const ambEl = document.getElementById('ambn-audio');
             const chsEl = document.getElementById('chs-audio');
 
-            if (mainMonsterState === 'wandering') {
+            if (isEndingChase) {
+                mainMonsterState = 'chasing';
+                inChase = true;
+            } else if (mainMonsterState === 'wandering') {
                 if (canSeePlayer) {
                     mainMonsterState = 'chasing';
                     chaseTimer = 20.0;
@@ -1453,7 +1535,7 @@
                     inChase = false;
                 }
             } else if (mainMonsterState === 'chasing') {
-                if (isCrouching) {
+                if (isCrouching && !isEndingChase) {
                     mainMonsterState = 'wandering';
                     inChase = false;
                     currentPath = [];
@@ -1461,7 +1543,7 @@
                     if (ambEl && ambEl.paused && !gamePaused) ambEl.play().catch(e=>{});
                 } else {
                     chaseTimer -= delta;
-                    if (chaseTimer <= 0 && distToPlayer > 12.0 && !canSeePlayer) {
+                    if (chaseTimer <= 0 && distToPlayer > 12.0 && !canSeePlayer && !isEndingChase) {
                         mainMonsterState = 'wandering';
                         inChase = false;
                         currentPath = [];
@@ -1520,7 +1602,7 @@
             }
 
             if (!cheatFreezeMonster) {
-                let speed = monsterSpeedMod + (gearsCollected * 0.4);
+                let speed = isEndingChase ? 18.0 : (monsterSpeedMod + (gearsCollected * 0.4));
                 let currentXZ = new THREE.Vector3(mainMonster.position.x, 0, mainMonster.position.z);
                 let dir = targetVec.clone().sub(currentXZ);
                 let len = dir.length();
@@ -1538,7 +1620,7 @@
                     tempObj.lookAt(lookTarget);
                     mainMonster.quaternion.slerp(tempObj.quaternion, delta * 12.0);
 
-                    mainMonsterStepTimer += delta * (mainMonsterState === 'chasing' ? 7.0 : 3.5);
+                    mainMonsterStepTimer += delta * (isEndingChase ? 11.0 : (mainMonsterState === 'chasing' ? 7.0 : 3.5));
                     if (mainMonsterStepTimer > 1.0) {
                         mainMonsterStepTimer = 0;
                         playMonsterHeavyFootstep(distToPlayer);
@@ -1668,6 +1750,9 @@
 
                     if (gearsCollected === 1 && !firstGearEventTriggered) {
                         firstGearEventTriggered = true;
+                        minimapErrorPermanentlyActive = true;
+                        document.getElementById('minimap-error').style.display = 'flex';
+
                         let flickerTimer = 0;
                         let flickerInterval = setInterval(() => {
                             flickerTimer += 0.1;
@@ -1686,16 +1771,22 @@
                         }, 100);
                     }
 
-                    if (gearsCollected === 3 && !thirdGearMinimapBlackout) {
-                        thirdGearMinimapBlackout = true;
-                        document.getElementById('minimap-error').style.display = 'flex';
-                    }
-
-                    if (!monsterSpawned && mainMonster) {
+                    if (gearsCollected >= 5 && !isEndingChase) {
+                        isEndingChase = true;
+                        monsterSpawned = true;
+                        mainMonster.visible = true;
+                        mainMonster.position.copy(playerPos).add(new THREE.Vector3(5, 0, 5));
+                        playLongDeepChaseBoom();
+                        playScreechAudio();
+                        const ambEl = document.getElementById('ambn-audio');
+                        const chsEl = document.getElementById('chs-audio');
+                        if (ambEl) ambEl.pause();
+                        if (chsEl) { chsEl.currentTime = 0; chsEl.volume = 0.5; chsEl.play().catch(e=>{}); }
+                    } else if (!monsterSpawned && mainMonster) {
                         monsterSpawned = true;
                         mainMonster.visible = true;
                         mainMonster.position.set(13 * tileSize, 0, 13 * tileSize);
-                    } else if (monsterSpawned && mainMonster) {
+                    } else if (monsterSpawned && mainMonster && !isEndingChase) {
                         if (mainMonsterState !== 'chasing') {
                             mainMonsterState = 'wandering';
                             investigationTarget = { x: collectingGear.gridX, z: collectingGear.gridZ };
@@ -1703,14 +1794,6 @@
                             let mGridZ = Math.floor((mainMonster.position.z + tileSize / 2) / tileSize);
                             currentPath = findPath({x: mGridX, z: mGridZ}, investigationTarget);
                         }
-                    }
-
-                    if (gearsCollected >= 5) {
-                        hasWon = true;
-                        let winScreen = document.getElementById('win-screen');
-                        if (winScreen) winScreen.style.display = 'flex';
-                        if (document.pointerLockElement) document.exitPointerLock();
-                        return;
                     }
 
                     collectingGear = null;
@@ -1763,7 +1846,7 @@
                 if (staticOverlay) staticOverlay.style.opacity = '0';
             }
 
-            let targetFOV = inChase ? 120 : 95;
+            let targetFOV = (inChase || isEndingChase) ? 120 : 95;
             camera.fov = THREE.MathUtils.lerp(camera.fov, targetFOV, 0.05);
             camera.updateProjectionMatrix();
 
@@ -1787,8 +1870,31 @@
                 let hitsMonsterX = monsterSpawned && mainMonster && testX.distanceTo(new THREE.Vector3(mainMonster.position.x, playerPos.y, mainMonster.position.z)) < 0.75;
                 
                 if (hitsMonsterX && !isCrouching && !cheatGodmode && !cheatFreezeMonster) {
-                    triggerDeath();
-                    return;
+                    if (isEndingChase) {
+                        isDead = true;
+                        survivalTime = (performance.now() - gameStartTime) / 1000;
+                        let deathScreen = document.getElementById('death-screen');
+                        deathScreen.style.display = 'flex';
+                        document.getElementById('death-time').innerText = '';
+                        document.getElementById('death-retry-btn').style.opacity = '0';
+                        const ambEl = document.getElementById('ambn-audio');
+                        const chsEl = document.getElementById('chs-audio');
+                        if (ambEl) ambEl.pause();
+                        if (chsEl) chsEl.pause();
+                        if (document.pointerLockElement) document.exitPointerLock();
+
+                        setTimeout(() => {
+                            deathScreen.style.display = 'none';
+                            let winScreen = document.getElementById('win-screen');
+                            winScreen.style.display = 'flex';
+                            setTimeout(() => { winScreen.style.opacity = '1'; }, 50);
+                            document.getElementById('win-time').innerText = `You survived for ${Math.floor(survivalTime)} seconds`;
+                        }, 2000);
+                        return;
+                    } else {
+                        triggerDeath();
+                        return;
+                    }
                 }
                 if (!hitsWallX && !hitsMonsterX) {
                     playerPos.x = nextPos.x;
@@ -1799,8 +1905,31 @@
                 let hitsMonsterZ = monsterSpawned && mainMonster && testZ.distanceTo(new THREE.Vector3(mainMonster.position.x, playerPos.y, mainMonster.position.z)) < 0.75;
                 
                 if (hitsMonsterZ && !isCrouching && !cheatGodmode && !cheatFreezeMonster) {
-                    triggerDeath();
-                    return;
+                    if (isEndingChase) {
+                        isDead = true;
+                        survivalTime = (performance.now() - gameStartTime) / 1000;
+                        let deathScreen = document.getElementById('death-screen');
+                        deathScreen.style.display = 'flex';
+                        document.getElementById('death-time').innerText = '';
+                        document.getElementById('death-retry-btn').style.opacity = '0';
+                        const ambEl = document.getElementById('ambn-audio');
+                        const chsEl = document.getElementById('chs-audio');
+                        if (ambEl) ambEl.pause();
+                        if (chsEl) chsEl.pause();
+                        if (document.pointerLockElement) document.exitPointerLock();
+
+                        setTimeout(() => {
+                            deathScreen.style.display = 'none';
+                            let winScreen = document.getElementById('win-screen');
+                            winScreen.style.display = 'flex';
+                            setTimeout(() => { winScreen.style.opacity = '1'; }, 50);
+                            document.getElementById('win-time').innerText = `You survived for ${Math.floor(survivalTime)} seconds`;
+                        }, 2000);
+                        return;
+                    } else {
+                        triggerDeath();
+                        return;
+                    }
                 }
                 if (!hitsWallZ && !hitsMonsterZ) {
                     playerPos.z = nextPos.z;
@@ -1811,16 +1940,13 @@
                     let freq = canRun ? bobFrequencySprint : bobFrequencyWalk;
                     let amount = canRun ? bobAmountSprint : bobAmountWalk;
                     bobTimer += delta * freq;
-                    let shakeFactor = (distToMonster < 6.0) ? (6.0 - distToMonster) * 0.07 : 0;
-                    camera.position.y = targetCameraY + Math.sin(bobTimer) * (isCrouching ? 0.02 : amount) + (Math.random() - 0.5) * shakeFactor;
+                    camera.position.y = targetCameraY + Math.sin(bobTimer) * (isCrouching ? 0.02 : amount);
 
                     if (!isCrouching && Math.sin(bobTimer) < -0.9 && Math.abs(Math.cos(delta * freq)) > 0.1) {
                         playRealConcreteFootstep();
                     }
                 } else {
-                    let idleBob = Math.sin(globalTime * 2.0) * 0.015;
-                    let shakeFactor = (distToMonster < 6.0) ? (6.0 - distToMonster) * 0.07 : 0;
-                    camera.position.y = THREE.MathUtils.lerp(camera.position.y, targetCameraY + idleBob, 0.1) + (Math.random() - 0.5) * shakeFactor;
+                    camera.position.y = THREE.MathUtils.lerp(camera.position.y, targetCameraY, 0.1);
                 }
             }
 
